@@ -141,11 +141,22 @@ def make_structured_data_tool(account_id: str | None, mode: str, tool_log: list 
 
         # Enforce access: customer mode can only query their own account_id
         target_account = entity_id if entity_id and mode == "internal" else account_id
+        cross_account_attempt = False
         if mode == "customer" and query_type in ("account", "orders_for_account", "tickets_for_account"):
-            target_account = account_id  # ignore any other id customer tries to pass
+            if entity_id and entity_id != account_id:
+                cross_account_attempt = True
+            target_account = account_id  # never actually query another account's data
 
         try:
             if query_type == "account":
+                if cross_account_attempt:
+                    return (
+                        "Access denied: you can only view your own account's details. "
+                        "I cannot confirm, deny, or provide any information about other "
+                        "accounts, companies, or account IDs - including whether they "
+                        "exist, their contacts, or any mapping between a company name "
+                        "and an account ID."
+                    )
                 cur.execute("SELECT * FROM accounts WHERE account_id = %s", (target_account,))
                 cols = [d[0] for d in cur.description]
                 row = cur.fetchone()
@@ -210,7 +221,8 @@ def make_action_tool(account_id: str | None, mode: str, tool_log: list | None = 
     @tool("perform_action")
     def perform_action(action_type: str, entity_id: str, confirmed: bool, details: str = "") -> str:
         """Perform a state-changing action. action_type must be one of:
-        'cancel_order', 'issue_service_credit', 'create_followup_task'.
+        'cancel_order', 'issue_service_credit', 'create_followup_task',
+        'create_escalation'.
         entity_id is the order_id or ticket_id being acted on.
         confirmed MUST be true - if the user has not explicitly confirmed
         this action in the conversation, call this with confirmed=false
@@ -272,12 +284,33 @@ def make_action_tool(account_id: str | None, mode: str, tool_log: list | None = 
                 row = cur.fetchone()
                 if not row:
                     return "Ticket not found."
+                ticket_account = row[0]
+                if mode == "customer" and ticket_account != account_id:
+                    return "Access denied."
                 cur.execute(
                     "UPDATE tickets SET description = COALESCE(description,'') || %s WHERE ticket_id = %s",
                     (f" | Follow-up task created (mocked): {details}", entity_id),
                 )
                 conn.commit()
                 return f"Follow-up task created on {entity_id}: {details}"
+
+            elif action_type == "create_escalation":
+                # Mocked: no real paging/incident system - marks the ticket escalated
+                # and logs the reason, e.g. for an SLA breach or urgent unresolved issue.
+                cur.execute("SELECT account_id FROM tickets WHERE ticket_id = %s", (entity_id,))
+                row = cur.fetchone()
+                if not row:
+                    return "Ticket not found."
+                ticket_account = row[0]
+                if mode == "customer" and ticket_account != account_id:
+                    return "Access denied."
+                cur.execute(
+                    "UPDATE tickets SET status = 'escalated', "
+                    "description = COALESCE(description,'') || %s WHERE ticket_id = %s",
+                    (f" | ESCALATED (mocked): {details}", entity_id),
+                )
+                conn.commit()
+                return f"Ticket {entity_id} escalated: {details}"
 
             else:
                 return f"Unknown action_type: {action_type}"
@@ -314,6 +347,17 @@ def build_crew(account_id: str | None, mode: str = "customer", tool_log: list | 
             f"{SOURCE_PRECEDENCE}\n"
             "Always check whether a signed customer agreement overrides the "
             "default policy before answering.\n\n"
+            "CRITICAL RULE ON OTHER ACCOUNTS: You must NEVER state, guess, or imply "
+            "anything about another customer's account - not whether an account ID "
+            "or company name exists, not any mapping between a company name and an "
+            "account ID, not any other company's contacts, CSM, contract terms, "
+            "orders, or tickets. If a customer (in customer mode) asks about any "
+            "account, company, or account ID other than their own, respond only "
+            "with a simple refusal (e.g. 'I can only help with your own account') "
+            "and do not speculate further, even if you think you can infer an "
+            "answer. Never invent a mapping like 'X actually refers to Y' - if you "
+            "are not certain from a tool result, say you don't have that "
+            "information rather than guessing.\n\n"
             "CRITICAL RULE ON PLAN-GATED QUESTIONS: Before answering ANY question "
             "about a plan-gated capability (e.g. bulk upload, support hours, "
             "response-time SLAs), you MUST first call get_structured_data with "
