@@ -229,13 +229,18 @@ def make_action_tool(account_id: str | None, mode: str, tool_log: list | None = 
     def perform_action(action_type: str, entity_id: str, confirmed: bool, details: str = "") -> str:
         """Perform a state-changing action. action_type must be one of:
         'cancel_order', 'issue_service_credit', 'create_followup_task',
-        'create_escalation', 'update_ticket'.
-        entity_id is the order_id or ticket_id being acted on.
+        'create_escalation', 'update_ticket', 'create_ticket'.
+        entity_id is the order_id or ticket_id being acted on - leave empty
+        for 'create_ticket' (not required for that action).
+        If the customer's issue has NO existing ticket_id, use 'create_ticket'
+        FIRST (details = description of the issue) to open one, then use the
+        new ticket_id returned from that call for any follow-up action like
+        create_escalation.
         confirmed MUST be true - if the user has not explicitly confirmed
         this action in the conversation, call this with confirmed=false
         first to get the confirmation prompt, and only call again with
         confirmed=true after the user has explicitly agreed.
-        details is a free-text note (e.g. reason, credit amount)."""
+        details is a free-text note (e.g. reason, credit amount, issue description)."""
         if tool_log is not None:
             tool_log.append({"tool": "perform_action", "input": f"{action_type} on {entity_id} (confirmed={confirmed})"})
 
@@ -336,6 +341,32 @@ def make_action_tool(account_id: str | None, mode: str, tool_log: list | None = 
                 )
                 conn.commit()
                 return f"Ticket {entity_id} escalated: {details}"
+
+            elif action_type == "create_ticket":
+                # Creates a brand-new ticket for an issue that doesn't have one
+                # yet - use this BEFORE create_escalation/create_followup_task/
+                # update_ticket if the customer has no existing ticket_id.
+                # entity_id is not required for this action; details should
+                # describe the issue and becomes the ticket's subject/description.
+                target_acct = account_id if mode == "customer" else (entity_id or account_id)
+                if not target_acct:
+                    return "Cannot create ticket: no account specified."
+                new_ticket_id = f"TKT-{int(datetime.utcnow().timestamp())}"
+                subject = (details[:80] + "...") if details and len(details) > 80 else (details or "New issue")
+                cur.execute(
+                    """
+                    INSERT INTO tickets
+                        (ticket_id, account_id, created_at, status, subject,
+                         description, channel, assigned_to)
+                    VALUES (%s, %s, NOW(), 'open', %s, %s, 'chat', 'Unassigned')
+                    """,
+                    (new_ticket_id, target_acct, subject, details or ""),
+                )
+                conn.commit()
+                return (
+                    f"New ticket created: {new_ticket_id}. Use this ticket_id for "
+                    f"any follow-up action (e.g. escalation) on this issue."
+                )
 
             else:
                 return f"Unknown action_type: {action_type}"
@@ -452,7 +483,15 @@ def build_crew(account_id: str | None, mode: str = "customer", tool_log: list | 
             "plainly which known issue (by ID) explains the real cause.\n\n"
             "Never take a state-changing action without explicit user confirmation. "
             "If you are uncertain about carrier fault, timing, or eligibility after "
-            "checking all available sources, say so and do not guess."
+            "checking all available sources, say so and do not guess.\n\n"
+            "TONE RULE ON CONFIRMATIONS: Only ask for confirmation once per action - "
+            "after the customer has clearly agreed once (e.g. 'yes', 'go ahead', "
+            "'please do'), proceed and do not ask again in a different way. Vary "
+            "your confirmation phrasing naturally across a conversation instead of "
+            "repeating the same 'could you confirm...' construction every time - "
+            "sound like a helpful person, not a script. If you already have enough "
+            "information to act, ask once, plainly, and move on as soon as the "
+            "customer responds."
         ),
         tools=tools,
         verbose=True,
