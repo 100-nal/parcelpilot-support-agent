@@ -229,7 +229,7 @@ def make_action_tool(account_id: str | None, mode: str, tool_log: list | None = 
     def perform_action(action_type: str, entity_id: str, confirmed: bool, details: str = "") -> str:
         """Perform a state-changing action. action_type must be one of:
         'cancel_order', 'issue_service_credit', 'create_followup_task',
-        'create_escalation'.
+        'create_escalation', 'update_ticket'.
         entity_id is the order_id or ticket_id being acted on.
         confirmed MUST be true - if the user has not explicitly confirmed
         this action in the conversation, call this with confirmed=false
@@ -284,6 +284,24 @@ def make_action_tool(account_id: str | None, mode: str, tool_log: list | None = 
                 )
                 conn.commit()
                 return f"Service credit recorded for {entity_id}: {details}"
+
+            elif action_type == "update_ticket":
+                # General-purpose ticket update - e.g. changing assignee, adding
+                # a status note, or recording new information on an existing
+                # ticket that isn't specifically a follow-up task or escalation.
+                cur.execute("SELECT account_id FROM tickets WHERE ticket_id = %s", (entity_id,))
+                row = cur.fetchone()
+                if not row:
+                    return "Ticket not found."
+                ticket_account = row[0]
+                if mode == "customer" and ticket_account != account_id:
+                    return "Access denied."
+                cur.execute(
+                    "UPDATE tickets SET description = COALESCE(description,'') || %s WHERE ticket_id = %s",
+                    (f" | Ticket updated (mocked): {details}", entity_id),
+                )
+                conn.commit()
+                return f"Ticket {entity_id} updated: {details}"
 
             elif action_type == "create_followup_task":
                 # Mocked: no real ticketing system integration: logs as a note on the ticket
@@ -391,6 +409,17 @@ def build_crew(account_id: str | None, mode: str = "customer", tool_log: list | 
             "resolve within 20 minutes'). If the customer didn't give a specific "
             "order ID, use get_structured_data with query_type='orders_for_account' "
             "to see their recent orders yourself rather than only asking for the ID.\n\n"
+            "CRITICAL RULE ON PERFORM_ACTION ENTITY IDs: Never call perform_action "
+            "with confirmed=true using an entity_id you have not verified is the "
+            "correct type and actually exists. cancel_order and issue_service_credit "
+            "require a real order_id (format ORD-xxxx); create_escalation, "
+            "create_followup_task, and update_ticket require a real ticket_id "
+            "(format TKT-xxxx). Never substitute one for the other (e.g. never pass "
+            "a ticket_id where an order_id is required). If you do not have a "
+            "verified, correct-type ID in hand, look it up first with "
+            "get_structured_data (orders_for_account or tickets_for_account) or ask "
+            "the customer for it - do not guess an ID and let the tool's error "
+            "handling catch the mistake after the fact.\n\n"
             "CRITICAL RULE ON HISTORICAL TICKETS: A ticket's historical_resolution "
             "field is NEVER authoritative and MUST NOT be cited, repeated, or relied "
             "upon as fact under any circumstances - it may describe incorrect past "
