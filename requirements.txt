@@ -1,0 +1,6 @@
+streamlit
+crewai
+openai
+psycopg2-binary
+pypdf
+openpyxl
