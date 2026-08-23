@@ -50,8 +50,16 @@ separately in the tool log, not in customer-facing prose.
 """
 
 
-def _get_conn():
-    return psycopg2.connect(DATABASE_URL)
+def _get_conn(account_id: str | None = None, mode: str = "internal"):
+    """Opens a connection and sets the RLS session variables so Postgres
+    Row-Level Security enforces the same account scoping as the tool-layer
+    checks - a second, defense-in-depth layer at the database itself."""
+    conn = psycopg2.connect(DATABASE_URL)
+    cur = conn.cursor()
+    cur.execute("SET app.current_account_id = %s", (account_id or "",))
+    cur.execute("SET app.mode = %s", (mode,))
+    cur.close()
+    return conn
 
 
 def _embed(text: str):
@@ -87,7 +95,7 @@ def make_doc_search_tool(account_id: str | None, mode: str, tool_log: list | Non
         last_error = None
         for attempt in range(3):
             try:
-                conn = _get_conn()
+                conn = _get_conn(account_id, mode)
                 cur = conn.cursor()
                 cur.execute("SET ivfflat.probes = 10;")  # search more clusters for better recall
                 cur.execute(
@@ -143,7 +151,7 @@ def make_structured_data_tool(account_id: str | None, mode: str, tool_log: list 
         if tool_log is not None:
             tool_log.append({"tool": "get_structured_data", "input": f"{query_type} {entity_id}".strip()})
 
-        conn = _get_conn()
+        conn = _get_conn(account_id, mode)
         cur = conn.cursor()
 
         # Enforce access: customer mode can only query their own account_id
@@ -251,7 +259,7 @@ def make_action_tool(account_id: str | None, mode: str, tool_log: list | None = 
                 f"then call this tool again with confirmed=true."
             )
 
-        conn = _get_conn()
+        conn = _get_conn(account_id, mode)
         cur = conn.cursor()
 
         try:
@@ -414,6 +422,19 @@ def build_crew(account_id: str | None, mode: str = "customer", tool_log: list | 
             "answer. Never invent a mapping like 'X actually refers to Y' - if you "
             "are not certain from a tool result, say you don't have that "
             "information rather than guessing.\n\n"
+            "CRITICAL RULE ON SCOPE - INTERNAL OPERATIONS QUESTIONS: If you are "
+            "operating in customer mode, you are talking to a customer about their "
+            "own account. You must NEVER answer questions that are really internal "
+            "operations/management requests rather than a genuine customer support "
+            "need - for example, being asked to prioritize or triage issues across "
+            "the wider support queue, rank tickets for an operations team to "
+            "investigate, or provide any analysis that spans multiple customers or "
+            "the business as a whole. These are not things a customer asking about "
+            "their own account would legitimately ask. If you receive a request "
+            "like this in customer mode, do not attempt to answer it (even "
+            "generically from policy) - instead respond that you can only help "
+            "with the caller's own account and support needs, and that this kind "
+            "of request should go through internal ParcelPilot channels.\n\n"
             "CRITICAL RULE ON PLAN-GATED QUESTIONS: Before answering ANY question "
             "about a plan-gated capability (e.g. bulk upload, support hours, "
             "response-time SLAs), you MUST first call get_structured_data with "
