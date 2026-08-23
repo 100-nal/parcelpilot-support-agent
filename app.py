@@ -45,8 +45,12 @@ os.environ.setdefault("OPENAI_API_KEY", get_openai_key())
 
 @st.cache_data(ttl=300)
 def get_accounts():
+    # This lists ALL accounts to populate the sign-in dropdown, before
+    # anyone has "signed in" - so it must run in internal mode to see
+    # past RLS, which otherwise scopes every query to a specific account.
     conn = psycopg2.connect(get_database_url())
     cur = conn.cursor()
+    cur.execute("SET app.mode = 'internal'")
     cur.execute("SELECT account_id, account_name FROM accounts ORDER BY account_name")
     rows = cur.fetchall()
     cur.close()
